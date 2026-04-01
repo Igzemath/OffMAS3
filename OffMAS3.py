@@ -23,6 +23,7 @@ import ctypes
 from ctypes import wintypes
 import customtkinter as ctk
 from tkinter import filedialog
+import tkinter.messagebox as mb
 import webbrowser
 
 ctk.set_appearance_mode("dark")
@@ -271,27 +272,6 @@ def format_size(size_bytes) -> str:
     else:
         return f"{b / 1024 ** 3:.2f} GB"
 
-
-def find_aria2c() -> str | None:
-    dbg("find_aria2c() recherche aria2c…")
-    found = shutil.which("aria2c")
-    if found:
-        dbg(f"  aria2c trouvé dans PATH : {found}", "OK")
-        return found
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2c.exe")
-    if os.path.isfile(local):
-        dbg(f"  aria2c trouvé local : {local}", "OK")
-        return local
-    dl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Downloads")
-    if os.path.isdir(dl):
-        a = os.path.join(dl, "aria2c.exe")
-        if os.path.isfile(a):
-            dbg(f"  aria2c trouvé dans Downloads : {a}", "OK")
-            return a
-    dbg("  aria2c NON TROUVÉ", "WARN")
-    return None
-
-
 def find_script(name: str) -> str | None:
     dbg(f"find_script('{name}') recherche…")
     sd = os.path.dirname(os.path.abspath(__file__))
@@ -447,22 +427,105 @@ def check_office_activation_status() -> dict:
         dbg("  Office non installé")
         return info
 
-    # ── Méthode 1 : ospp.vbs (plusieurs chemins possibles) ──
+    # ── Méthode 1 : Détection Ohook (prioritaire) ──
+    dbg("  Vérification Ohook…")
     pf = os.environ.get("ProgramFiles", r"C:\Program Files")
     pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
-    paths_to_try = [
-        # Office 365 / 2021+ (Click-to-Run, chemin standard)
-        os.path.join(pf, "Microsoft Office", "root", "Office16", "ospp.vbs"),
-        os.path.join(pf86, "Microsoft Office", "root", "Office16", "ospp.vbs"),
-        # Office 2019 et antérieur (MSI)
-        os.path.join(pf, "Microsoft Office", "Office16", "ospp.vbs"),
-        os.path.join(pf86, "Microsoft Office", "Office16", "ospp.vbs"),
-        os.path.join(pf, "Microsoft Office", "Office15", "ospp.vbs"),
-        os.path.join(pf86, "Microsoft Office", "Office15", "ospp.vbs"),
+    # Ohook installe des DLL spécifiques
+    ohook_files = [
+        os.path.join(pf, "Microsoft Office", "root", "vfs",
+                     "System", "sppcs.dll"),
+        os.path.join(pf, "Microsoft Office", "root", "Office16",
+                     "sppc64.dll"),
+        os.path.join(pf, "Microsoft Office", "root", "Office16",
+                     "sppc32.dll"),
+        os.path.join(pf86, "Microsoft Office", "root", "vfs",
+                     "System", "sppcs.dll"),
+        os.path.join(pf86, "Microsoft Office", "root", "Office16",
+                     "sppc64.dll"),
+        os.path.join(pf86, "Microsoft Office", "root", "Office16",
+                     "sppc32.dll"),
     ]
 
-    # Aussi chercher via le registre le vrai chemin d'installation
+    # Aussi chercher via InstallationPath du registre
+    try:
+        for reg_key in [
+            r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+            r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\ClickToRun\Configuration",
+        ]:
+            cmd = f'reg query "{reg_key}" /v InstallationPath'
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    shell=True, creationflags=0x08000000, timeout=5)
+            if result.returncode == 0:
+                m = re.search(r'REG_SZ\s+(.+)', result.stdout)
+                if m:
+                    install_path = m.group(1).strip()
+                    ohook_files.extend([
+                        os.path.join(install_path, "root", "vfs",
+                                     "System", "sppcs.dll"),
+                        os.path.join(install_path, "root", "Office16",
+                                     "sppc64.dll"),
+                        os.path.join(install_path, "root", "Office16",
+                                     "sppc32.dll"),
+                    ])
+                    break
+    except Exception:
+        pass
+
+    for dll_path in ohook_files:
+        if os.path.isfile(dll_path):
+            dbg(f"  Ohook DLL trouvée : {dll_path}", "OK")
+            info["activated"] = True
+
+            # Vérifier que c'est bien un hook Ohook (pas le fichier système original)
+            try:
+                size = os.path.getsize(dll_path)
+                dbg(f"  Taille DLL : {size} octets")
+                # Les DLL Ohook font typiquement < 500 KB
+                # Les originales Microsoft sont plus grosses
+                if size < 600000:
+                    dbg("  Taille compatible Ohook -> ACTIVÉ", "OK")
+                else:
+                    dbg("  Taille trop grande, peut-être DLL originale", "WARN")
+                    info["activated"] = False
+                    continue
+            except Exception:
+                pass
+
+            dbg("  Activation Ohook détectée", "OK")
+            return info
+
+    # ── Méthode 2 : Registre Ohook (clés spécifiques) ──
+    dbg("  Vérification registre Ohook…")
+    ohook_reg_keys = [
+        r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+    ]
+    for reg_key in ohook_reg_keys:
+        try:
+            # Chercher les clés que Ohook écrit
+            cmd = f'reg query "{reg_key}" /v ProductReleaseIds'
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    shell=True, creationflags=0x08000000, timeout=5)
+            if result.returncode == 0:
+                m = re.search(r'REG_SZ\s+(.+)', result.stdout)
+                if m:
+                    dbg(f"  ProductReleaseIds : {m.group(1).strip()}")
+        except Exception:
+            pass
+
+    # ── Méthode 3 : ospp.vbs (fallback, ne détecte pas Ohook) ──
+    dbg("  Vérification ospp.vbs (fallback)…")
+
+    ospp = None
+    paths_to_try = [
+        os.path.join(pf, "Microsoft Office", "root", "Office16", "ospp.vbs"),
+        os.path.join(pf86, "Microsoft Office", "root", "Office16", "ospp.vbs"),
+        os.path.join(pf, "Microsoft Office", "Office16", "ospp.vbs"),
+        os.path.join(pf86, "Microsoft Office", "Office16", "ospp.vbs"),
+    ]
+
+    # Ajouter chemin via registre
     try:
         reg_path = r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
         cmd = f'reg query "{reg_path}" /v InstallationPath'
@@ -472,16 +535,11 @@ def check_office_activation_status() -> dict:
             m = re.search(r'REG_SZ\s+(.+)', result.stdout)
             if m:
                 install_path = m.group(1).strip()
-                reg_ospp = os.path.join(install_path, "root", "Office16", "ospp.vbs")
-                paths_to_try.insert(0, reg_ospp)
-                dbg(f"  Chemin registre ajouté : {reg_ospp}")
-                # Aussi sans "root"
-                reg_ospp2 = os.path.join(install_path, "Office16", "ospp.vbs")
-                paths_to_try.insert(1, reg_ospp2)
-    except Exception as e:
-        dbg(f"  Erreur lecture InstallationPath : {e}", "ERR")
+                paths_to_try.insert(0, os.path.join(
+                    install_path, "root", "Office16", "ospp.vbs"))
+    except Exception:
+        pass
 
-    ospp = None
     for pp in paths_to_try:
         dbg(f"  Recherche ospp.vbs : {pp}")
         if os.path.isfile(pp):
@@ -501,9 +559,12 @@ def check_office_activation_status() -> dict:
                 stripped = line.strip()
                 if stripped:
                     dbg(f"    | {stripped}")
-            if "licensed" in out.lower():
+            if "licensed" in out.lower() and "notification" not in out.lower():
                 info["activated"] = True
                 dbg("  Statut : LICENSED (activé)", "OK")
+            elif "notification" in out.lower() or "grace" in out.lower():
+                # Peut être Ohook — vérifier les DLL une dernière fois
+                dbg("  Statut : Notification/Grace — vérif Ohook implicite", "WARN")
             else:
                 dbg("  Statut : NON licensed", "WARN")
         except subprocess.TimeoutExpired:
@@ -511,73 +572,7 @@ def check_office_activation_status() -> dict:
         except Exception as e:
             dbg(f"  Erreur ospp.vbs : {e}", "ERR")
     else:
-        dbg("  ospp.vbs NON TROUVÉ, tentative via registre", "WARN")
-
-    # ── Méthode 2 (fallback) : vérifier via le registre Ohook ──
-    if not info["activated"] and not ospp:
-        dbg("  Tentative détection activation via registre Ohook…")
-        ohook_indicators = [
-            r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
-        ]
-        for reg_key in ohook_indicators:
-            try:
-                # Vérifier si Ohook a écrit ses clés
-                cmd = f'reg query "{reg_key}" /v ProductReleaseIds'
-                result = subprocess.run(cmd, capture_output=True, text=True,
-                                        shell=True, creationflags=0x08000000, timeout=5)
-                if result.returncode == 0:
-                    m = re.search(r'REG_SZ\s+(.+)', result.stdout)
-                    if m:
-                        product_ids = m.group(1).strip()
-                        dbg(f"  ProductReleaseIds : {product_ids}")
-            except Exception:
-                pass
-
-        # Vérifier la présence des fichiers Ohook (sppsvc hook)
-        ohook_dll_paths = [
-            os.path.join(pf, "Microsoft Office", "root", "vfs",
-                         "System", "sppcs.dll"),
-            os.path.join(pf, "Microsoft Office", "root", "Office16",
-                         "sppc64.dll"),
-        ]
-        for dll_path in ohook_dll_paths:
-            if os.path.isfile(dll_path):
-                dbg(f"  Ohook DLL trouvée : {dll_path} -> considéré activé", "OK")
-                info["activated"] = True
-                break
-
-    # ── Méthode 3 (fallback) : vérifier via cscript sur ospp en admin ──
-    if not info["activated"] and ospp:
-        dbg("  Tentative ospp.vbs en élévation admin…")
-        # ospp.vbs peut nécessiter des droits admin pour /dstatus
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        wrapper_path = os.path.join(script_dir, "_check_activation.bat")
-        result_path = os.path.join(script_dir, "_activation_result.txt")
-        try:
-            with open(wrapper_path, "w", encoding="cp850") as f:
-                f.write("@echo off\r\n")
-                f.write(f'cscript //nologo "{ospp}" /dstatus > "{result_path}" 2>&1\r\n')
-                f.write("exit /b 0\r\n")
-
-            # Note: on ne peut pas appeler _run_as_admin ici car c'est statique
-            # et on est dans une fonction globale. On essaie sans admin.
-            proc = subprocess.run(
-                f'cscript //nologo "{ospp}" /dstatus',
-                capture_output=True, text=True, timeout=15,
-                shell=True, creationflags=0x08000000)
-            if "licensed" in proc.stdout.lower():
-                info["activated"] = True
-                dbg("  Statut (retry) : LICENSED", "OK")
-        except Exception as e:
-            dbg(f"  Erreur retry ospp : {e}", "ERR")
-        finally:
-            # Nettoyage
-            for fp in [wrapper_path, result_path]:
-                try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                except Exception:
-                    pass
+        dbg("  ospp.vbs NON TROUVÉ", "WARN")
 
     dbg(f"  Résultat final activation : {info}")
     return info
@@ -663,8 +658,6 @@ class App(ctk.CTk):
         self.after(400, self._scan_source)
         dbg("  Scan source planifié (after 400ms)")
 
-        dbg("Entrée dans mainloop()")
-
     # ──────────────────────────────────────────
     # Vérification scripts requis
     # ──────────────────────────────────────────
@@ -673,7 +666,6 @@ class App(ctk.CTk):
         dbg("--- Vérification des scripts requis ---", "STEP")
         required = [
             "YAOCTRU_Generator.cmd",
-            "YAOCTRIR_Installer.cmd",
             "Ohook_Activation_AIO.cmd",
             "aria2c.exe",
         ]
@@ -788,16 +780,19 @@ class App(ctk.CTk):
         ctk.CTkFrame(self, height=1, fg_color=COL["border"]).pack(
             fill="x", padx=30, pady=(8, 12))
 
-        # ═══ ZONE HAUTE : État + Source ═══
-        top_row = ctk.CTkFrame(self, fg_color="transparent")
-        top_row.pack(fill="x", padx=30, pady=(0, 8))
-        top_row.columnconfigure(0, weight=1)
-        top_row.columnconfigure(1, weight=1)
+        # ═══ GRILLE UNIQUE : Zone haute + 4 cartes ═══
+        grid_frame = ctk.CTkFrame(self, fg_color="transparent")
+        grid_frame.pack(fill="both", expand=True, padx=30, pady=(0, 8))
+        for i in range(4):
+            grid_frame.columnconfigure(i, weight=1, uniform="grid")
+        grid_frame.rowconfigure(0, weight=0)  # ligne haute : taille auto
+        grid_frame.rowconfigure(1, weight=1)  # ligne cartes : extensible
 
-        # ── GAUCHE : État d'activation ──
-        af = ctk.CTkFrame(top_row, corner_radius=10, fg_color=COL["bg_card"],
+        # ── LIGNE 0, GAUCHE : État d'activation (colonnes 0-1) ──
+        af = ctk.CTkFrame(grid_frame, corner_radius=10, fg_color=COL["bg_card"],
                           border_width=1, border_color=COL["border"])
-        af.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        af.grid(row=0, column=0, columnspan=2, sticky="nsew",
+                padx=(0, 4), pady=(0, 8))
 
         ah = ctk.CTkFrame(af, fg_color="transparent")
         ah.pack(fill="x", padx=16, pady=(12, 4))
@@ -834,10 +829,11 @@ class App(ctk.CTk):
             text_color=COL["text_secondary"], anchor="w", justify="left")
         self.act_details.pack(padx=16, pady=(0, 12), anchor="w")
 
-        # ── DROITE : Source & Actions ──
-        sf = ctk.CTkFrame(top_row, corner_radius=10, fg_color=COL["bg_card"],
+        # ── LIGNE 0, DROITE : Source & Actions (colonnes 2-3) ──
+        sf = ctk.CTkFrame(grid_frame, corner_radius=10, fg_color=COL["bg_card"],
                           border_width=1, border_color=COL["border"])
-        sf.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        sf.grid(row=0, column=2, columnspan=2, sticky="nsew",
+                padx=(4, 0), pady=(0, 8))
 
         sh = ctk.CTkFrame(sf, fg_color="transparent")
         sh.pack(fill="x", padx=16, pady=(12, 4))
@@ -878,21 +874,15 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11), state="disabled")
         self.btn_delete_source.pack(side="left")
 
-        # ═══ 4 CARTES ═══
-        cards_row = ctk.CTkFrame(self, fg_color="transparent")
-        cards_row.pack(fill="both", expand=True, padx=30, pady=(0, 8))
-        for i in range(4):
-            cards_row.columnconfigure(i, weight=1, uniform="cards")
-        cards_row.grid_rowconfigure(0, weight=1)
-
+        # ── LIGNE 1 : 4 cartes ──
         dbg("  Construction carte 1 : Téléchargement")
-        self._build_card_download(cards_row, 0)
+        self._build_card_download(grid_frame, 0)
         dbg("  Construction carte 2 : Édition")
-        self._build_card_edition(cards_row, 1)
+        self._build_card_edition(grid_frame, 1)
         dbg("  Construction carte 3 : Applications")
-        self._build_card_apps(cards_row, 2)
+        self._build_card_apps(grid_frame, 2)
         dbg("  Construction carte 4 : Paramètres")
-        self._build_card_settings(cards_row, 3)
+        self._build_card_settings(grid_frame, 3)
 
         # ═══ ZONE BASSE : Progression + Install ═══
         self._make_sep(self)
@@ -943,12 +933,12 @@ class App(ctk.CTk):
         self.btn_install.pack()
 
     # ── Carte 1 : Téléchargement ──
-
     def _build_card_download(self, parent, col):
         card = ctk.CTkFrame(parent, corner_radius=10, fg_color=COL["bg_card"],
                             border_width=1, border_color=COL["border"])
-        card.grid(row=0, column=col, sticky="nsew",
+        card.grid(row=1, column=col, sticky="nsew",
                   padx=(0 if col == 0 else 4, 4 if col < 3 else 0), pady=0)
+                  
         self._card_header(card, "TÉLÉCHARGEMENT", COL["accent_purple"])
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1001,7 +991,6 @@ class App(ctk.CTk):
 
         if not self.scripts.get("aria2c.exe"):
             dbg("  aria2c.exe manquant -> blocage", "ERR")
-            import tkinter.messagebox as mb
             mb.showerror("Dépendance manquante",
                          "aria2c.exe est introuvable !\n\n"
                          "Placez aria2c.exe dans le même dossier que le programme\n"
@@ -1012,7 +1001,6 @@ class App(ctk.CTk):
 
         if not self.scripts.get("YAOCTRU_Generator.cmd"):
             dbg("  YAOCTRU_Generator.cmd manquant -> blocage", "ERR")
-            import tkinter.messagebox as mb
             mb.showerror("Script manquant", "YAOCTRU_Generator.cmd est introuvable !")
             return
 
@@ -1099,7 +1087,7 @@ class App(ctk.CTk):
     def _build_card_edition(self, parent, col):
         card = ctk.CTkFrame(parent, corner_radius=10, fg_color=COL["bg_card"],
                             border_width=1, border_color=COL["border"])
-        card.grid(row=0, column=col, sticky="nsew", padx=4, pady=0)
+        card.grid(row=1, column=col, sticky="nsew", padx=4, pady=0)
         self._card_header(card, "ÉDITION", COL["accent_blue"])
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1151,7 +1139,7 @@ class App(ctk.CTk):
     def _build_card_apps(self, parent, col):
         card = ctk.CTkFrame(parent, corner_radius=10, fg_color=COL["bg_card"],
                             border_width=1, border_color=COL["border"])
-        card.grid(row=0, column=col, sticky="nsew", padx=4, pady=0)
+        card.grid(row=1, column=col, sticky="nsew", padx=4, pady=0)
         self._card_header(card, "APPLICATIONS", COL["accent_teal"])
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1175,7 +1163,7 @@ class App(ctk.CTk):
     def _build_card_settings(self, parent, col):
         card = ctk.CTkFrame(parent, corner_radius=10, fg_color=COL["bg_card"],
                             border_width=1, border_color=COL["border"])
-        card.grid(row=0, column=col, sticky="nsew", padx=(4, 0), pady=0)
+        card.grid(row=1, column=col, sticky="nsew", padx=(4, 0), pady=0)
         self._card_header(card, "PARAMÈTRES", COL["accent_orange"])
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1349,7 +1337,6 @@ class App(ctk.CTk):
         if not self._c2r_path or not os.path.isdir(self._c2r_path):
             dbg("  Pas de source à supprimer", "WARN")
             return
-        import tkinter.messagebox as mb
         if not mb.askyesno("Confirmation",
                            f"Supprimer la source ?\n\n{self._c2r_path}\n\nAction irréversible."):
             dbg("  Suppression annulée par l'utilisateur")
@@ -1420,7 +1407,6 @@ class App(ctk.CTk):
 
         if not self.scripts.get("aria2c.exe"):
             dbg("  aria2c.exe manquant -> blocage", "ERR")
-            import tkinter.messagebox as mb
             mb.showerror("Dépendance manquante",
                          "aria2c.exe est introuvable !\n\n"
                          "Placez aria2c.exe dans le même dossier que le programme\n"
@@ -1431,7 +1417,6 @@ class App(ctk.CTk):
 
         if not self.scripts.get("YAOCTRU_Generator.cmd"):
             dbg("  YAOCTRU_Generator.cmd manquant -> blocage", "ERR")
-            import tkinter.messagebox as mb
             mb.showerror("Script manquant", "YAOCTRU_Generator.cmd est introuvable !")
             return
 
@@ -1440,6 +1425,7 @@ class App(ctk.CTk):
         self._download_error_detected = False
         self.btn_install.configure(state="disabled")
         self.btn_uninstall.configure(state="disabled")
+        self.btn_download_only.configure(state="disabled")   # ← AJOUTER
         self.btn_cancel_dl.configure(state="normal")
         self.dl_progress.set(0)
         self.dl_percent.configure(text="0 % (0/0)")
@@ -1489,7 +1475,6 @@ class App(ctk.CTk):
         info = get_installed_office_info()
         if not info:
             dbg("  Office non détecté", "WARN")
-            import tkinter.messagebox as mb
             mb.showinfo("Désinstallation", "Aucune installation Office détectée.")
             return
 
@@ -1497,7 +1482,6 @@ class App(ctk.CTk):
         arch = info.get("arch", "?")
         lang = info.get("lang", "?")
 
-        import tkinter.messagebox as mb
         confirm = mb.askyesno(
             "Désinstallation complète d'Office",
             f"Voulez-vous désinstaller complètement Office ?\n\n"
@@ -1535,10 +1519,11 @@ class App(ctk.CTk):
         start_time = time.time()
 
         try:
-            # ── Étape 1/5 : Fermeture des applications Office ──
-            dbg("  Étape 1/5 : Fermeture des applications Office", "STEP")
+            # ── Étape 1/4 : Fermeture des applications ──
+            dbg("  Étape 1/4 : Fermeture des applications Office", "STEP")
             self.after(0, lambda: self._dl_set_status(
-                "Étape 1/5 — Fermeture des applications Office…", COL["status_warn"]))
+                "Étape 1/4 — Fermeture des applications Office…",
+                COL["status_warn"]))
             self.after(0, lambda: self.dl_progress.set(0.05))
 
             office_processes = [
@@ -1560,22 +1545,20 @@ class App(ctk.CTk):
                         dbg(f"    Fermé : {proc_name}", "OK")
                 except Exception:
                     pass
-
             if killed > 0:
                 dbg(f"  {killed} processus fermé(s)", "OK")
                 time.sleep(2)
-            else:
-                dbg("  Aucun processus Office à fermer")
 
             if self._download_cancel.is_set():
                 self.after(0, lambda: self._dl_set_status(
                     "Désinstallation annulée", COL["status_warn"]))
                 return
 
-            # ── Étape 2/5 : Désinstallation via setup.exe ODT ──
-            dbg("  Étape 2/5 : Désinstallation via ODT/C2R", "STEP")
+            # ── Étape 2/4 : Désinstallation via ODT/C2R ──
+            dbg("  Étape 2/4 : Désinstallation via ODT/C2R", "STEP")
             self.after(0, lambda: self._dl_set_status(
-                "Étape 2/5 — Désinstallation des composants Office…", COL["status_warn"]))
+                "Étape 2/4 — Désinstallation des composants Office…",
+                COL["status_warn"]))
             self.after(0, lambda: self.dl_progress.set(0.15))
 
             uninstalled = self._uninstall_via_c2r_setup()
@@ -1585,15 +1568,15 @@ class App(ctk.CTk):
                     "Désinstallation annulée", COL["status_warn"]))
                 return
 
-            # ── Étape 3/5 : Fallback via OfficeClickToRun.exe ──
+            # ── Étape 3/4 : Fallback via OfficeClickToRun ──
             if not uninstalled:
-                dbg("  Étape 3/5 : Fallback via OfficeClickToRun productstoremove", "STEP")
+                dbg("  Étape 3/4 : Fallback via OfficeClickToRun", "STEP")
                 self.after(0, lambda: self._dl_set_status(
-                    "Étape 3/5 — Méthode alternative de désinstallation…", COL["status_warn"]))
+                    "Étape 3/4 — Méthode alternative…",
+                    COL["status_warn"]))
                 self.after(0, lambda: self.dl_progress.set(0.35))
-                uninstalled = self._uninstall_via_click_to_run()
+                self._uninstall_via_click_to_run()
             else:
-                dbg("  Étape 3/5 : Ignorée (ODT a réussi)")
                 self.after(0, lambda: self.dl_progress.set(0.5))
 
             if self._download_cancel.is_set():
@@ -1601,43 +1584,55 @@ class App(ctk.CTk):
                     "Désinstallation annulée", COL["status_warn"]))
                 return
 
-            # ── Étape 4/5 : Nettoyage registre ──
-            dbg("  Étape 4/5 : Nettoyage registre", "STEP")
+            # ── Étape 4/4 : Nettoyage complet ──
+            dbg("  Étape 4/4 : Nettoyage complet", "STEP")
             self.after(0, lambda: self._dl_set_status(
-                "Étape 4/5 — Nettoyage du registre…", COL["status_warn"]))
-            self.after(0, lambda: self.dl_progress.set(0.65))
-            self._cleanup_registry()
-
-            if self._download_cancel.is_set():
-                self.after(0, lambda: self._dl_set_status(
-                    "Désinstallation annulée", COL["status_warn"]))
-                return
-
-            # ── Étape 5/5 : Nettoyage fichiers ──
-            dbg("  Étape 5/5 : Nettoyage fichiers résiduels", "STEP")
-            self.after(0, lambda: self._dl_set_status(
-                "Étape 5/5 — Nettoyage des fichiers résiduels…", COL["status_warn"]))
-            self.after(0, lambda: self.dl_progress.set(0.85))
-            self._cleanup_office_files()
+                "Étape 4/4 — Nettoyage complet (registre, fichiers, services)…",
+                COL["status_warn"]))
+            self.after(0, lambda: self.dl_progress.set(0.6))
+            self._full_cleanup()
 
             # ── Vérification finale ──
             self.after(0, lambda: self.dl_progress.set(0.95))
             dbg("  Vérification post-désinstallation…", "STEP")
             time.sleep(3)
+
             post_info = get_installed_office_info()
+            really_there = self._is_office_really_installed()
             elapsed = time.time() - start_time
 
-            if post_info and post_info.get("version"):
-                dbg(f"  Office encore détecté : v{post_info['version']}", "WARN")
+            if post_info and really_there:
+                dbg(f"  Office encore installé : v{post_info['version']}",
+                    "WARN")
                 self.after(0, lambda: self.dl_progress.set(1))
                 self.after(0, lambda e=elapsed: self._dl_set_status(
-                    f"Désinstallation partielle ({e:.0f}s) — redémarrage recommandé",
-                    COL["status_warn"]))
+                    f"Désinstallation partielle ({e:.0f}s) — "
+                    f"redémarrage recommandé", COL["status_warn"]))
+            elif post_info and not really_there:
+                # Résidus registre restants, refaire un nettoyage
+                dbg("  Résidus registre restants, 2ème nettoyage…", "WARN")
+                self._full_cleanup()
+                time.sleep(2)
+                post_info2 = get_installed_office_info()
+                if post_info2:
+                    dbg("  Résidus persistants après 2ème nettoyage", "WARN")
+                    self.after(0, lambda: self.dl_progress.set(1))
+                    self.after(0, lambda e=elapsed: self._dl_set_status(
+                        f"Désinstallation terminée ({e:.0f}s) — "
+                        f"résidus registre persistants, redémarrez",
+                        COL["status_warn"]))
+                else:
+                    dbg("  2ème nettoyage a tout supprimé", "OK")
+                    self.after(0, lambda: self.dl_progress.set(1))
+                    self.after(0, lambda e=elapsed: self._dl_set_status(
+                        f"✓ Office désinstallé avec succès ({e:.0f}s)",
+                        COL["status_ok"]))
             else:
                 dbg(f"  Office complètement supprimé en {elapsed:.1f}s", "OK")
                 self.after(0, lambda: self.dl_progress.set(1))
                 self.after(0, lambda e=elapsed: self._dl_set_status(
-                    f"✓ Office désinstallé avec succès ({e:.0f}s)", COL["status_ok"]))
+                    f"✓ Office désinstallé avec succès ({e:.0f}s)",
+                    COL["status_ok"]))
 
         except Exception as e:
             dbg(f"[Thread] EXCEPTION désinstallation : {e}", "ERR")
@@ -1671,8 +1666,12 @@ class App(ctk.CTk):
         """Désinstalle via setup.exe /configure avec XML Remove All"""
         dbg("_uninstall_via_c2r_setup() démarré", "STEP")
 
-        # Chercher setup.exe dans le dossier ClickToRun
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Chercher setup.exe : à côté du script D'ABORD, puis dans ClickToRun
         setup_paths = [
+            os.path.join(script_dir, "setup.exe"),
+            os.path.join(script_dir, "Downloads", "setup.exe"),
             os.path.join(os.environ.get("CommonProgramFiles", ""),
                          "Microsoft Shared", "ClickToRun", "setup.exe"),
             os.path.join(os.environ.get("ProgramFiles", ""),
@@ -1687,21 +1686,20 @@ class App(ctk.CTk):
                 setup_exe = p
                 dbg(f"  setup.exe trouvé : {p}", "OK")
                 break
+            else:
+                dbg(f"  setup.exe absent : {p}")
 
         if not setup_exe:
-            dbg("  setup.exe ClickToRun non trouvé", "WARN")
+            dbg("  setup.exe NON TROUVÉ", "WARN")
             return False
 
         # Créer XML de désinstallation
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         xml_path = os.path.join(script_dir, "_uninstall_config.xml")
-
-        xml_content = ('  <Configuration>\n'
-                       '    <Remove All="TRUE">\n'
-                       '    </Remove>\n'
-                       '    <Display Level="None" AcceptEULA="TRUE" />\n'
-                       '    <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />\n'
-                       '  </Configuration>\n')
+        xml_content = '''<Configuration>
+  <Remove All="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+</Configuration>'''
 
         try:
             with open(xml_path, "w", encoding="utf-8") as f:
@@ -1713,11 +1711,20 @@ class App(ctk.CTk):
 
         # Créer wrapper
         wrapper_path = os.path.join(script_dir, "_auto_uninstall.bat")
+        uninstall_log = os.path.join(script_dir, "_uninstall_output.log")
         try:
             with open(wrapper_path, "w", encoding="cp850") as f:
                 f.write("@echo off\r\n")
-                f.write(f'"{setup_exe}" /configure "{xml_path}"\r\n')
-                f.write("exit /b %errorlevel%\r\n")
+                f.write(f'cd /d "{os.path.dirname(setup_exe)}"\r\n')
+                f.write(f'echo [%date% %time%] Lancement desinstallation > "{uninstall_log}"\r\n')
+                f.write(f'echo Setup: {setup_exe} >> "{uninstall_log}"\r\n')
+                f.write(f'echo XML: {xml_path} >> "{uninstall_log}"\r\n')
+                f.write(f'echo. >> "{uninstall_log}"\r\n')
+                f.write(f'"{setup_exe}" /configure "{xml_path}" >> "{uninstall_log}" 2>&1\r\n')
+                f.write("set EC=%errorlevel%\r\n")
+                f.write(f'echo. >> "{uninstall_log}"\r\n')
+                f.write(f'echo Exit code: %EC% >> "{uninstall_log}"\r\n')
+                f.write("exit /b %EC%\r\n")
             dbg(f"  Wrapper créé : {wrapper_path}", "OK")
         except Exception as e:
             dbg(f"  Erreur création wrapper : {e}", "ERR")
@@ -1727,6 +1734,23 @@ class App(ctk.CTk):
         try:
             exit_code = self._run_as_admin(wrapper_path, script_dir, wait=True)
             dbg(f"  Désinstallation ODT terminée : exit_code={exit_code}")
+
+            # Lire la sortie
+            if os.path.isfile(uninstall_log):
+                try:
+                    with open(uninstall_log, "r", encoding="cp850",
+                              errors="replace") as f:
+                        content = f.read()
+                    dbg("  ╔══ Sortie désinstallation ══", "STEP")
+                    for line in content.splitlines():
+                        s = line.rstrip()
+                        if s:
+                            dbg(f"  ║ {s}")
+                    dbg("  ╚══ Fin sortie ══", "STEP")
+                except Exception:
+                    pass
+                self._cleanup_file(uninstall_log)
+
             return exit_code == 0
         except Exception as e:
             dbg(f"  Erreur exécution désinstallation : {e}", "ERR")
@@ -1789,80 +1813,6 @@ class App(ctk.CTk):
         except Exception as e:
             dbg(f"  Erreur : {e}", "ERR")
             return False
-        finally:
-            self._cleanup_file(wrapper_path)
-
-    def _cleanup_registry(self):
-        dbg("_cleanup_registry() démarré", "STEP")
-        reg_keys = [
-            r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun",
-            r"HKLM\SOFTWARE\Microsoft\Office\16.0",
-            r"HKCU\SOFTWARE\Microsoft\Office\16.0",
-            r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\ClickToRun",
-            r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\16.0",
-        ]
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        wrapper_path = os.path.join(script_dir, "_auto_regclean.bat")
-
-        try:
-            with open(wrapper_path, "w", encoding="cp850") as f:
-                f.write("@echo off\r\n")
-                for key in reg_keys:
-                    f.write(f'reg delete "{key}" /f >nul 2>&1\r\n')
-                f.write("exit /b 0\r\n")
-
-            exit_code = self._run_as_admin(wrapper_path, script_dir, wait=True)
-            dbg(f"  Nettoyage registre terminé : exit_code={exit_code}")
-        except Exception as e:
-            dbg(f"  Erreur nettoyage registre : {e}", "ERR")
-        finally:
-            self._cleanup_file(wrapper_path)
-
-    def _cleanup_office_files(self):
-        dbg("_cleanup_office_files() démarré", "STEP")
-
-        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        common = os.environ.get("CommonProgramFiles", "")
-        common86 = os.environ.get("CommonProgramFiles(x86)", "")
-        prog_data = os.environ.get("ProgramData", r"C:\ProgramData")
-
-        dirs_to_clean = [
-            os.path.join(pf, "Microsoft Office"),
-            os.path.join(pf86, "Microsoft Office"),
-            os.path.join(common, "Microsoft Shared", "ClickToRun"),
-            os.path.join(common86, "Microsoft Shared", "ClickToRun"),
-        ]
-
-        start_menu = os.path.join(prog_data, "Microsoft", "Windows",
-                                  "Start Menu", "Programs")
-        shortcuts = [
-            "Word.lnk", "Excel.lnk", "PowerPoint.lnk", "Outlook.lnk",
-            "OneNote.lnk", "Access.lnk", "Publisher.lnk",
-        ]
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        wrapper_path = os.path.join(script_dir, "_auto_fileclean.bat")
-
-        try:
-            with open(wrapper_path, "w", encoding="cp850") as f:
-                f.write("@echo off\r\n")
-                for d in dirs_to_clean:
-                    if d:
-                        f.write(f'if exist "{d}" rmdir /s /q "{d}" 2>nul\r\n')
-                for s in shortcuts:
-                    sp = os.path.join(start_menu, s)
-                    f.write(f'if exist "{sp}" del /f "{sp}" 2>nul\r\n')
-                f.write('schtasks /delete /tn "\\Microsoft\\Office\\*" /f >nul 2>&1\r\n')
-                f.write('sc stop "ClickToRunSvc" >nul 2>&1\r\n')
-                f.write('sc delete "ClickToRunSvc" >nul 2>&1\r\n')
-                f.write("exit /b 0\r\n")
-
-            exit_code = self._run_as_admin(wrapper_path, script_dir, wait=True)
-            dbg(f"  Nettoyage fichiers terminé : exit_code={exit_code}")
-        except Exception as e:
-            dbg(f"  Erreur nettoyage fichiers : {e}", "ERR")
         finally:
             self._cleanup_file(wrapper_path)
 
@@ -2251,109 +2201,212 @@ class App(ctk.CTk):
         dbg(f"  Source : {self._c2r_path}")
         dbg(f"  Suite  : {self.selected_suite_id.get()}")
 
-        # 1. Générer INI
-        dbg("  Étape 1/4 : Génération INI", "STEP")
-        ini_path = self._generate_ini()
-        if not ini_path:
-            dbg("  Échec génération INI", "ERR")
-            self.after(0, lambda: self._dl_set_status(
-                "Échec de la génération du fichier INI", COL["status_err"]))
-            return False
-        dbg(f"  INI généré : {ini_path}", "OK")
+        # ── Snapshot AVANT installation ──
+        pre_info = get_installed_office_info()
+        pre_version = pre_info["version"] if pre_info else ""
+        dbg(f"  Office AVANT installation : "
+            f"{'v' + pre_version if pre_version else 'NON installé'}")
 
-        # 2. Copier INI vers le dossier de l'installateur
-        dbg("  Étape 2/4 : Copie INI", "STEP")
-        installer_path = self.scripts.get("YAOCTRIR_Installer.cmd")
-        if not installer_path:
-            installer_path = find_script("YAOCTRIR_Installer.cmd")
-        if not installer_path:
-            dbg("  YAOCTRIR_Installer.cmd introuvable !", "ERR")
+        # ── Nettoyage préalable si résidus détectés sans Office réel ──
+        if pre_version and not self._is_office_really_installed():
+            dbg("  Résidus registre détectés sans Office réel -> nettoyage", "WARN")
             self.after(0, lambda: self._dl_set_status(
-                "YAOCTRIR_Installer.cmd introuvable", COL["status_err"]))
-            return False
+                "Nettoyage des résidus d'une ancienne installation…",
+                COL["status_warn"]))
+            self._full_cleanup()
+            time.sleep(2)
+            pre_info = get_installed_office_info()
+            pre_version = pre_info["version"] if pre_info else ""
 
-        installer_dir = os.path.dirname(installer_path)
-        target_ini = os.path.join(installer_dir, "C2RR_Config.ini")
+        # ── 1. Trouver setup.exe ──
+        dbg("  Étape 1/4 : Recherche setup.exe", "STEP")
+        setup_exe = self._find_setup_exe()
+        if not setup_exe:
+            dbg("  setup.exe introuvable dans la source !", "ERR")
+            self.after(0, lambda: self._dl_set_status(
+                "setup.exe introuvable dans la source Office",
+                COL["status_err"]))
+            return False
+        dbg(f"  setup.exe trouvé : {setup_exe}", "OK")
+
+        # ── 2. Générer XML ODT ──
+        dbg("  Étape 2/4 : Génération XML ODT", "STEP")
+        xml_path = self._generate_odt_xml()
+        if not xml_path:
+            dbg("  Échec génération XML", "ERR")
+            self.after(0, lambda: self._dl_set_status(
+                "Échec de la génération du fichier XML", COL["status_err"]))
+            return False
+        dbg(f"  XML généré : {xml_path}", "OK")
+
+        # ── Afficher le XML ──
         try:
-            shutil.copy2(ini_path, target_ini)
-            dbg(f"  INI copié : {ini_path} -> {target_ini}", "OK")
-        except Exception as e:
-            dbg(f"  Erreur copie INI : {e}", "ERR")
-            self.after(0, lambda e=e: self._dl_set_status(
-                f"Erreur copie INI : {e}", COL["status_err"]))
-            return False
+            with open(xml_path, "r", encoding="utf-8") as f:
+                dbg("  Contenu XML :")
+                for line in f:
+                    dbg(f"    {line.rstrip()}")
+        except Exception:
+            pass
 
-        # 3. Créer wrapper auto-répondeur + lancer en admin
-        dbg("  Étape 3/4 : Lancement installateur (admin, auto)", "STEP")
-        dbg(f"  Installateur : {installer_path}")
-        dbg(f"  Work dir     : {installer_dir}")
-
+        # ── 3. Lancer setup.exe /configure ──
+        dbg("  Étape 3/4 : Lancement setup.exe /configure", "STEP")
         self.after(0, lambda: self._dl_set_status(
-            "Installation d'Office en cours (élévation admin)…", COL["status_warn"]))
+            "Installation d'Office en cours (élévation admin)…",
+            COL["status_warn"]))
 
-        wrapper_path = os.path.join(installer_dir, "_auto_install.bat")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wrapper_path = os.path.join(script_dir, "_auto_install.bat")
+        install_log = os.path.join(script_dir, "_install_output.log")
+
         try:
             with open(wrapper_path, "w", encoding="cp850") as f:
                 f.write("@echo off\r\n")
-                f.write(f'echo 1 | call "{installer_path}"\r\n')
-                f.write("exit /b %errorlevel%\r\n")
+                f.write(f'cd /d "{os.path.dirname(setup_exe)}"\r\n')
+                f.write(f'echo [%date% %time%] Lancement setup.exe /configure > "{install_log}"\r\n')
+                f.write(f'echo Setup: {setup_exe} >> "{install_log}"\r\n')
+                f.write(f'echo XML: {xml_path} >> "{install_log}"\r\n')
+                f.write(f'echo. >> "{install_log}"\r\n')
+                f.write(f'"{setup_exe}" /configure "{xml_path}" >> "{install_log}" 2>&1\r\n')
+                f.write("set EC=%errorlevel%\r\n")
+                f.write(f'echo. >> "{install_log}"\r\n')
+                f.write(f'echo Exit code: %EC% >> "{install_log}"\r\n')
+                f.write("exit /b %EC%\r\n")
             dbg(f"  Wrapper créé : {wrapper_path}", "OK")
+
+            with open(wrapper_path, "r", encoding="cp850") as f:
+                dbg(f"  Contenu wrapper:\n{f.read()}")
+
         except Exception as e:
             dbg(f"  Erreur création wrapper : {e}", "ERR")
-            self.after(0, lambda e=e: self._dl_set_status(
-                f"Erreur : {e}", COL["status_err"]))
-            self._cleanup_file(target_ini)
+            self._cleanup_file(xml_path)
             return False
 
-        t_install_start = time.time()
+        t_start = time.time()
         install_ok = False
 
         try:
-            exit_code = self._run_as_admin(wrapper_path, installer_dir, wait=True)
-            elapsed = time.time() - t_install_start
-            dbg(f"  Installateur terminé : exit_code={exit_code} en {elapsed:.1f}s")
+            exit_code = self._run_as_admin(wrapper_path, script_dir, wait=True)
+            elapsed_setup = time.time() - t_start
+            dbg(f"  setup.exe terminé : exit_code={exit_code} en {elapsed_setup:.1f}s")
 
             if exit_code == -1:
-                dbg("  Élévation refusée ou échouée", "ERR")
+                dbg("  Élévation refusée", "ERR")
                 self.after(0, lambda: self._dl_set_status(
-                    "Installation annulée — élévation admin refusée", COL["status_err"]))
-                self._cleanup_file(target_ini)
+                    "Installation annulée — élévation admin refusée",
+                    COL["status_err"]))
+                self._cleanup_file(xml_path)
                 self._cleanup_file(wrapper_path)
                 return False
-
-            install_ok = (exit_code == 0)
         except Exception as e:
             dbg(f"  Erreur installation : {e}", "ERR")
-            dbg(traceback.format_exc(), "ERR")
-            self.after(0, lambda e=e: self._dl_set_status(
-                f"Erreur installation : {e}", COL["status_err"]))
-            self._cleanup_file(target_ini)
+            self._cleanup_file(xml_path)
             self._cleanup_file(wrapper_path)
             return False
 
-        self._cleanup_file(target_ini)
         self._cleanup_file(wrapper_path)
 
-        # Vérification post-installation
+        # ── Lire la sortie ──
+        if os.path.isfile(install_log):
+            try:
+                with open(install_log, "r", encoding="cp850", errors="replace") as f:
+                    content = f.read()
+                dbg("  ╔══ Sortie setup.exe ══", "STEP")
+                for line in content.splitlines():
+                    s = line.rstrip()
+                    if s:
+                        dbg(f"  ║ {s}")
+                dbg("  ╚══ Fin sortie ══", "STEP")
+            except Exception as e:
+                dbg(f"  Erreur lecture log : {e}", "ERR")
+            self._cleanup_file(install_log)
+
+        # ── Attente du streaming C2R ──
+        if exit_code == 0 or elapsed_setup < 30:
+            dbg("  Attente de la fin du streaming C2R…", "STEP")
+            self.after(0, lambda: self._dl_set_status(
+                "Installation en cours — streaming des composants…",
+                COL["status_warn"]))
+
+            max_wait = 600
+            poll_interval = 5
+            waited = 0
+            last_log = 0
+
+            while waited < max_wait:
+                if self._download_cancel.is_set():
+                    break
+
+                if self._is_office_really_installed():
+                    dbg(f"  Office RÉELLEMENT installé après {waited}s", "OK")
+                    break
+
+                c2r_running = self._is_c2r_process_running()
+
+                if not c2r_running and waited > 30:
+                    dbg(f"  Processus C2R terminé après {waited}s", "WARN")
+                    break
+
+                time.sleep(poll_interval)
+                waited += poll_interval
+
+                if waited - last_log >= 15:
+                    status = "C2R actif" if c2r_running else "en attente"
+                    dbg(f"  Attente streaming : {waited}s ({status})…")
+                    self.after(0, lambda w=waited, s=status:
+                               self._dl_set_status(
+                                   f"Installation en cours… {w}s ({s})",
+                                   COL["status_warn"]))
+                    last_log = waited
+
+            time.sleep(3)
+
+        # ── Vérification post-installation ──
         dbg("  Vérification post-installation…", "STEP")
-        time.sleep(3)
         post_info = get_installed_office_info()
+        post_version = post_info["version"] if post_info else ""
+        really_installed = self._is_office_really_installed()
 
-        if post_info and post_info.get("version"):
-            dbg(f"  Office détecté : v{post_info['version']}", "OK")
+        dbg(f"  APRÈS : version='{post_version}', "
+            f"réellement installé={really_installed}, exit_code={exit_code}")
+
+        if really_installed and post_version:
+            dbg(f"  Installation réussie : v{post_version}", "OK")
             install_ok = True
-            self.after(0, lambda v=post_info['version']: self._dl_set_status(
-                f"Installation réussie — Office v{v}", COL["status_ok"]))
-        elif install_ok:
-            dbg("  exit_code=0 mais Office non détecté", "WARN")
-            self.after(0, lambda: self._dl_set_status(
-                "Installation terminée (vérifiez manuellement)", COL["status_warn"]))
-        else:
-            dbg(f"  Installation échouée", "ERR")
-            self.after(0, lambda: self._dl_set_status(
-                "Installation échouée", COL["status_err"]))
+            self.after(0, lambda v=post_version: self._dl_set_status(
+                f"✓ Installation réussie — Office v{v}", COL["status_ok"]))
 
-        # 4. Activation Ohook
+        elif post_version and not really_installed:
+            if self._is_c2r_process_running():
+                dbg("  C2R encore actif, attente supplémentaire…", "WARN")
+                for _ in range(24):
+                    time.sleep(5)
+                    if self._is_office_really_installed():
+                        install_ok = True
+                        dbg(f"  Office finalement installé", "OK")
+                        self.after(0, lambda v=post_version: self._dl_set_status(
+                            f"✓ Installation réussie — Office v{v}",
+                            COL["status_ok"]))
+                        break
+                    if not self._is_c2r_process_running():
+                        break
+                if not install_ok:
+                    self._full_cleanup()
+                    self.after(0, lambda: self._dl_set_status(
+                        "Installation incomplète", COL["status_warn"]))
+            else:
+                self._full_cleanup()
+                self.after(0, lambda: self._dl_set_status(
+                    "Installation échouée — Office non détecté",
+                    COL["status_err"]))
+        else:
+            self.after(0, lambda ec=exit_code: self._dl_set_status(
+                f"Installation échouée (code {ec})",
+                COL["status_err"]))
+
+        # ── Nettoyage XML ──
+        self._cleanup_file(xml_path)
+
+        # ── 4. Activation Ohook ──
         should_activate = self.opt_activate.get()
         dbg(f"  Étape 4/4 : Activation Ohook = {should_activate} "
             f"(install_ok={install_ok})", "STEP")
@@ -2364,15 +2417,265 @@ class App(ctk.CTk):
         elif not install_ok:
             dbg("  Activation ignorée (installation échouée)")
         else:
-            dbg("  Activation désactivée par l'utilisateur")
             self.after(0, lambda: self._dl_set_status(
-                "Installation terminée (activation désactivée)", COL["status_ok"]))
+                "Installation terminée (activation désactivée)",
+                COL["status_ok"]))
 
         dbg("  Planification revérification activation dans 3s")
         time.sleep(3)
         self.after(0, self._on_check_activation)
-
         return install_ok
+
+    def _is_office_really_installed(self) -> bool:
+        """Vérifie qu'Office est RÉELLEMENT installé (pas juste des résidus registre)"""
+        dbg("_is_office_really_installed() vérification…")
+
+        # Vérifier que les exécutables principaux existent
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+
+        exe_paths = [
+            os.path.join(pf, "Microsoft Office", "root", "Office16", "WINWORD.EXE"),
+            os.path.join(pf86, "Microsoft Office", "root", "Office16", "WINWORD.EXE"),
+            os.path.join(pf, "Microsoft Office", "root", "Office16", "EXCEL.EXE"),
+            os.path.join(pf86, "Microsoft Office", "root", "Office16", "EXCEL.EXE"),
+        ]
+
+        # Aussi chercher via le registre InstallationPath
+        try:
+            for reg_key in [
+                r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+                r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\ClickToRun\Configuration",
+            ]:
+                cmd = f'reg query "{reg_key}" /v InstallationPath'
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        shell=True, creationflags=0x08000000, timeout=5)
+                if result.returncode == 0:
+                    m = re.search(r'REG_SZ\s+(.+)', result.stdout)
+                    if m:
+                        install_path = m.group(1).strip()
+                        dbg(f"  InstallationPath : {install_path}")
+                        exe_paths.insert(0, os.path.join(
+                            install_path, "root", "Office16", "WINWORD.EXE"))
+                        exe_paths.insert(1, os.path.join(
+                            install_path, "root", "Office16", "EXCEL.EXE"))
+                        break
+        except Exception as e:
+            dbg(f"  Erreur lecture InstallationPath : {e}", "ERR")
+
+        for exe in exe_paths:
+            if os.path.isfile(exe):
+                dbg(f"  Exécutable trouvé : {exe} -> RÉELLEMENT installé", "OK")
+                return True
+
+        # Vérifier aussi le service ClickToRun
+        try:
+            result = subprocess.run(
+                'sc query "ClickToRunSvc"',
+                capture_output=True, text=True, shell=True,
+                creationflags=0x08000000, timeout=5)
+            if result.returncode == 0 and "RUNNING" in result.stdout.upper():
+                dbg("  Service ClickToRunSvc actif -> RÉELLEMENT installé", "OK")
+                return True
+        except Exception:
+            pass
+
+        dbg("  Aucun exécutable Office trouvé -> RÉSIDUS seulement", "WARN")
+        return False
+
+    def _is_c2r_process_running(self) -> bool:
+        """Vérifie si un processus d'installation C2R est en cours"""
+        c2r_processes = [
+            "OfficeClickToRun.exe",
+            "OfficeC2RClient.exe",
+            "setup.exe",
+        ]
+        for proc_name in c2r_processes:
+            try:
+                result = subprocess.run(
+                    f'tasklist /FI "IMAGENAME eq {proc_name}" /NH',
+                    capture_output=True, text=True, shell=True,
+                    creationflags=0x08000000, timeout=5)
+                if proc_name.lower() in result.stdout.lower():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _full_cleanup(self):
+        """Nettoyage complet : registre + fichiers + services + tâches planifiées"""
+        dbg("_full_cleanup() nettoyage complet démarré", "STEP")
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        common = os.environ.get("CommonProgramFiles", "")
+        common86 = os.environ.get("CommonProgramFiles(x86)", "")
+        prog_data = os.environ.get("ProgramData", r"C:\ProgramData")
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        appdata = os.environ.get("APPDATA", "")
+
+        wrapper_path = os.path.join(script_dir, "_full_cleanup.bat")
+
+        try:
+            with open(wrapper_path, "w", encoding="cp850") as f:
+                f.write("@echo off\r\n")
+                f.write("echo === Nettoyage complet Office ===\r\n\r\n")
+
+                # 1. Arrêter les services
+                f.write("echo [1/6] Arrêt des services...\r\n")
+                services = ["ClickToRunSvc", "ose64", "ose",
+                            "OfficeSvc", "Microsoft Office Click-to-Run"]
+                for svc in services:
+                    f.write(f'net stop "{svc}" /y >nul 2>&1\r\n')
+                    f.write(f'sc stop "{svc}" >nul 2>&1\r\n')
+
+                # 2. Tuer les processus
+                f.write("\r\necho [2/6] Fermeture des processus...\r\n")
+                processes = [
+                    "OfficeClickToRun.exe", "OfficeC2RClient.exe",
+                    "AppVShNotify.exe", "WINWORD.EXE", "EXCEL.EXE",
+                    "POWERPNT.EXE", "OUTLOOK.EXE", "ONENOTE.EXE",
+                    "MSACCESS.EXE", "MSPUB.EXE", "lync.exe",
+                    "Teams.exe", "setup.exe",
+                ]
+                for proc in processes:
+                    f.write(f'taskkill /F /IM "{proc}" >nul 2>&1\r\n')
+                f.write("timeout /t 3 /nobreak >nul\r\n")
+
+                # 3. Supprimer les services
+                f.write("\r\necho [3/6] Suppression des services...\r\n")
+                for svc in services:
+                    f.write(f'sc delete "{svc}" >nul 2>&1\r\n')
+
+                # 4. Nettoyage registre complet
+                f.write("\r\necho [4/6] Nettoyage registre...\r\n")
+                reg_keys = [
+                    # Clés principales ClickToRun
+                    r"HKLM\SOFTWARE\Microsoft\Office\ClickToRun",
+                    r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\ClickToRun",
+                    # Clés Office 16.0
+                    r"HKLM\SOFTWARE\Microsoft\Office\16.0",
+                    r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Office\16.0",
+                    r"HKCU\SOFTWARE\Microsoft\Office\16.0",
+                    # Clés de désinstallation
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365HomePremRetail - fr-fr",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365HomePremRetail - en-us",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365ProPlusRetail - fr-fr",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365ProPlusRetail - en-us",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365BusinessRetail - fr-fr",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365BusinessRetail - en-us",
+                    # Clés AppVISV
+                    r"HKLM\SOFTWARE\Microsoft\AppVISV",
+                    r"HKLM\SOFTWARE\Wow6432Node\Microsoft\AppVISV",
+                    # Clés Office commune
+                    r"HKLM\SOFTWARE\Microsoft\Office\Delivery",
+                    r"HKLM\SOFTWARE\Microsoft\Office\MS#",
+                    # Clés registre utilisateur
+                    r"HKCU\SOFTWARE\Microsoft\Office\16.0\Common\Licensing",
+                    r"HKCU\SOFTWARE\Microsoft\Office\16.0\Registration",
+                ]
+                for key in reg_keys:
+                    f.write(f'reg delete "{key}" /f >nul 2>&1\r\n')
+
+                # Aussi nettoyer toutes les clés Uninstall Office
+                f.write('for /f "tokens=*" %%i in (\'reg query '
+                        '"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
+                        '\\Uninstall" /f "Office" /k 2^>nul ^| findstr /i '
+                        '"HKEY_"\') do (\r\n')
+                f.write('  reg delete "%%i" /f >nul 2>&1\r\n')
+                f.write(')\r\n')
+
+                f.write('for /f "tokens=*" %%i in (\'reg query '
+                        '"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
+                        '\\Uninstall" /f "O365" /k 2^>nul ^| findstr /i '
+                        '"HKEY_"\') do (\r\n')
+                f.write('  reg delete "%%i" /f >nul 2>&1\r\n')
+                f.write(')\r\n')
+
+                f.write('for /f "tokens=*" %%i in (\'reg query '
+                        '"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
+                        '\\Uninstall" /f "Microsoft 365" /k 2^>nul ^| findstr /i '
+                        '"HKEY_"\') do (\r\n')
+                f.write('  reg delete "%%i" /f >nul 2>&1\r\n')
+                f.write(')\r\n')
+
+                # 5. Suppression des dossiers
+                f.write("\r\necho [5/6] Suppression des fichiers...\r\n")
+                dirs_to_clean = [
+                    os.path.join(pf, "Microsoft Office"),
+                    os.path.join(pf86, "Microsoft Office"),
+                    os.path.join(common, "Microsoft Shared", "ClickToRun"),
+                    os.path.join(common86, "Microsoft Shared", "ClickToRun"),
+                    os.path.join(common, "Microsoft Shared", "OfficeSoftwareProtectionPlatform"),
+                    os.path.join(prog_data, "Microsoft", "ClickToRun"),
+                    os.path.join(prog_data, "Microsoft", "Office"),
+                ]
+                if local_app:
+                    dirs_to_clean.append(
+                        os.path.join(local_app, "Microsoft", "Office"))
+                if appdata:
+                    dirs_to_clean.append(
+                        os.path.join(appdata, "Microsoft", "Office"))
+
+                for d in dirs_to_clean:
+                    if d:
+                        f.write(f'if exist "{d}" (\r\n')
+                        f.write(f'  echo   Suppression : {d}\r\n')
+                        f.write(f'  rmdir /s /q "{d}" 2>nul\r\n')
+                        f.write(f')\r\n')
+
+                # 6. Nettoyage raccourcis et tâches planifiées
+                f.write("\r\necho [6/6] Nettoyage raccourcis et taches...\r\n")
+                start_menu = os.path.join(
+                    prog_data, "Microsoft", "Windows",
+                    "Start Menu", "Programs")
+                shortcuts = [
+                    "Word.lnk", "Excel.lnk", "PowerPoint.lnk",
+                    "Outlook.lnk", "OneNote.lnk", "Access.lnk",
+                    "Publisher.lnk", "Microsoft Office Tools",
+                ]
+                for s in shortcuts:
+                    sp = os.path.join(start_menu, s)
+                    f.write(f'if exist "{sp}" (\r\n')
+                    # Gérer fichier ou dossier
+                    f.write(f'  if exist "{sp}\\*" (\r\n')
+                    f.write(f'    rmdir /s /q "{sp}" 2>nul\r\n')
+                    f.write(f'  ) else (\r\n')
+                    f.write(f'    del /f /q "{sp}" 2>nul\r\n')
+                    f.write(f'  )\r\n')
+                    f.write(f')\r\n')
+
+                # Tâches planifiées Office
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\Office Automatic Updates 2.0" /f >nul 2>&1\r\n')
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\Office ClickToRun Service Monitor" /f >nul 2>&1\r\n')
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\Office Feature Updates" /f >nul 2>&1\r\n')
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\Office Feature Updates Logon" /f >nul 2>&1\r\n')
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\OfficeTelemetryAgentFallBack2016" /f >nul 2>&1\r\n')
+                f.write('schtasks /delete /tn "\\Microsoft\\Office\\OfficeTelemetryAgentLogOn2016" /f >nul 2>&1\r\n')
+
+                f.write("\r\necho === Nettoyage termine ===\r\n")
+                f.write("exit /b 0\r\n")
+
+            dbg(f"  Script nettoyage créé : {wrapper_path}", "OK")
+
+            exit_code = self._run_as_admin(wrapper_path, script_dir, wait=True)
+            dbg(f"  Nettoyage complet terminé : exit_code={exit_code}")
+
+        except Exception as e:
+            dbg(f"  Erreur nettoyage complet : {e}", "ERR")
+            dbg(traceback.format_exc(), "ERR")
+        finally:
+            self._cleanup_file(wrapper_path)
+
+        # Vérification post-nettoyage
+        time.sleep(2)
+        post_clean = get_installed_office_info()
+        if post_clean:
+            dbg(f"  ⚠ Résidus encore présents après nettoyage : "
+                f"v{post_clean['version']}", "WARN")
+        else:
+            dbg("  Nettoyage complet réussi — aucun résidu", "OK")
 
     def _run_ohook_activation(self):
         self.after(0, lambda: self._dl_set_status(
@@ -2392,11 +2695,13 @@ class App(ctk.CTk):
 
         ohook_dir = os.path.dirname(ohook_path)
         wrapper_path = os.path.join(ohook_dir, "_auto_activate.bat")
+        activate_log = os.path.join(ohook_dir, "_activate_output.log")
 
         try:
             with open(wrapper_path, "w", encoding="cp850") as f:
                 f.write("@echo off\r\n")
-                f.write(f'call "{ohook_path}" /Ohook\r\n')
+                f.write(f'cd /d "{ohook_dir}"\r\n')
+                f.write(f'call "{ohook_path}" /Ohook > "{activate_log}" 2>&1\r\n')
                 f.write("exit /b %errorlevel%\r\n")
             dbg(f"  Wrapper activation créé : {wrapper_path}", "OK")
         except Exception as e:
@@ -2409,15 +2714,36 @@ class App(ctk.CTk):
             ohook_exit = self._run_as_admin(wrapper_path, ohook_dir, wait=True)
             dbg(f"  Ohook terminé : exit_code={ohook_exit}")
 
+            # Lire la sortie
+            if os.path.isfile(activate_log):
+                try:
+                    with open(activate_log, "r", encoding="cp850",
+                              errors="replace") as f:
+                        content = f.read()
+                    dbg("  ╔══ Sortie Ohook ══", "STEP")
+                    for line in content.splitlines():
+                        s = line.rstrip()
+                        if s:
+                            dbg(f"  ║ {s}")
+                    dbg("  ╚══ Fin sortie Ohook ══", "STEP")
+                except Exception as e:
+                    dbg(f"  Erreur lecture log Ohook : {e}", "ERR")
+                self._cleanup_file(activate_log)
+
+            time.sleep(5)
+
             if ohook_exit == 0:
                 self.after(0, lambda: self._dl_set_status(
-                    "✓ Installation et activation terminées", COL["status_ok"]))
+                    "✓ Installation et activation terminées",
+                    COL["status_ok"]))
             elif ohook_exit == -1:
                 self.after(0, lambda: self._dl_set_status(
-                    "Installation OK — activation annulée (UAC)", COL["status_warn"]))
+                    "Installation OK — activation annulée (UAC)",
+                    COL["status_warn"]))
             else:
                 self.after(0, lambda ec=ohook_exit: self._dl_set_status(
-                    f"Installation OK — activation code {ec}", COL["status_warn"]))
+                    f"Installation OK — activation code {ec}",
+                    COL["status_warn"]))
         except Exception as e:
             dbg(f"  Erreur activation Ohook : {e}", "ERR")
             self.after(0, lambda e=e: self._dl_set_status(
@@ -2429,92 +2755,134 @@ class App(ctk.CTk):
     # Génération INI
     # ──────────────────────────────────────────
 
-    def _generate_ini(self) -> str | None:
-        dbg("_generate_ini() démarré", "STEP")
-        if not self.source_valid or not self._c2r_path:
-            dbg("  Pas de source valide", "ERR")
-            return None
+    def _find_setup_exe(self) -> str | None:
+        """Trouve setup.exe dans la source Office"""
+        dbg("_find_setup_exe() recherche…")
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        candidates = [
+            os.path.join(script_dir, "setup.exe"),
+            os.path.join(script_dir, "Downloads", "setup.exe"),
+            os.path.join(self._c2r_path, "setup.exe"),
+            os.path.join(self._c2r_path, "Office", "setup.exe"),
+            os.path.join(self._c2r_path, "Office", "Data", "setup.exe"),
+        ]
+        for p in candidates:
+            dbg(f"  Candidat : {p} -> {'EXISTE' if os.path.isfile(p) else 'absent'}")
+            if os.path.isfile(p):
+                return p
+
+        # Chercher récursivement
+        for root, dirs, files in os.walk(self._c2r_path):
+            for f in files:
+                if f.lower() == "setup.exe":
+                    found = os.path.join(root, f)
+                    dbg(f"  Trouvé (recherche récursive) : {found}", "OK")
+                    return found
+
+        dbg("  setup.exe NON TROUVÉ", "ERR")
+        return None
+
+    def _generate_odt_xml(self) -> str | None:
+        """Génère le XML de configuration Office Deployment Tool"""
+        dbg("_generate_odt_xml() démarré", "STEP")
+
+        CHANNEL_ODT_MAP = {
+            "Monthly": "Current",
+            "MonthlyPreview": "CurrentPreview",
+            "Broad": "SemiAnnual",
+            "Targeted": "SemiAnnualPreview",
+            "Beta": "BetaChannel",
+            "Dogfood": "BetaChannel",
+            "PerpetualVL2019": "PerpetualVL2019",
+            "PerpetualVL2021": "PerpetualVL2021",
+            "PerpetualVL2024": "PerpetualVL2024",
+        }
 
         try:
-            downloads_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "Downloads")
-            os.makedirs(downloads_dir, exist_ok=True)
-            now = datetime.datetime.now().strftime('%Y%m%d-%H%M')
-            fpath = os.path.join(downloads_dir, f"Configuration_{now}.ini")
+            ver, arch, lang = "??", "x64", "fr-FR"
+            data_p = os.path.join(self._c2r_path, "Office", "Data")
+            cabs = glob.glob(os.path.join(data_p, "v*_*.cab"))
+            if cabs:
+                parts = os.path.basename(cabs[0]).split("_")
+                if len(parts) >= 2:
+                    arch = "x64" if "64" in parts[0] else "x86"
+                    ver = parts[1].replace(".cab", "")
+                vf = os.path.join(data_p, ver)
+                if os.path.isdir(vf):
+                    for s in os.listdir(vf):
+                        if s.startswith("stream.") and s.endswith(".dat"):
+                            pp = s.split(".")
+                            if len(pp) >= 3 and pp[2] not in ("x-none", "dat"):
+                                lang = pp[2]
+                                break
+            dbg(f"  Source parsée : ver={ver}, arch={arch}, lang={lang}")
 
-            lcid_map = {"fr-fr": "1036", "en-us": "1033",
-                        "es-es": "3082", "de-de": "1031"}
-
-            ver, arch, lang = "??", "x64", "fr-fr"
-            try:
-                data_p = os.path.join(self._c2r_path, "Office", "Data")
-                cabs = glob.glob(os.path.join(data_p, "v*_*.cab"))
-                dbg(f"  Analyse source : {len(cabs)} cab(s) trouvé(s)")
-                if cabs:
-                    parts = os.path.basename(cabs[0]).split("_")
-                    if len(parts) >= 2:
-                        arch = "x64" if "64" in parts[0] else "x86"
-                        ver = parts[1].replace(".cab", "")
-                    vf = os.path.join(data_p, ver)
-                    if os.path.isdir(vf):
-                        for s in os.listdir(vf):
-                            if s.startswith("stream.") and s.endswith(".dat"):
-                                pp = s.split(".")
-                                if len(pp) >= 3 and pp[2] not in ("x-none", "dat"):
-                                    lang = pp[2]
-                                    break
-                dbg(f"  Source parsée : ver={ver}, arch={arch}, lang={lang}")
-            except Exception as e:
-                dbg(f"  Erreur analyse source pour INI : {e}", "ERR")
-
-            lcid = lcid_map.get(lang.lower(), "1036")
-
-            excluded = []
-            for name, var in self.apps_vars.items():
-                if not var.get():
-                    excluded.append(APPS_MAP[name])
-            dbg(f"  Apps exclues : {excluded}")
-
+            edition = "64" if arch == "x64" else "32"
             suite_id = self.selected_suite_id.get()
-            channel = self.combo_update_channel.get()
+            channel_short = self.combo_update_channel.get()
+            channel_odt = CHANNEL_ODT_MAP.get(channel_short, "Current")
             src = self._c2r_path.replace("/", "\\")
 
-            dbg(f"  Suite ID  : {suite_id}")
-            dbg(f"  Canal MAJ : {channel}")
-            dbg(f"  Source    : {src}")
-            dbg(f"  LCID      : {lcid}")
+            dbg(f"  Canal UI : {channel_short} -> ODT : {channel_odt}")
 
-            content = f"""[configuration]
-SourcePath="{src}"
-Type=Local
-Version={ver}
-Architecture={arch}
-O32W64=0
-Language={lang}
-LCID={lcid}
-Channel={channel}
-CDN=492350f6-3a01-4f97-b9c0-c7c6ddf67d60
-Suite={suite_id}
-ExcludedApps={','.join(excluded)}
-UpdatesEnabled={self.opt_updates.get()}
-AcceptEULA={self.opt_eula.get()}
-PinIconsToTaskbar={self.opt_pin_taskbar.get()}
-ForceAppShutdown={self.opt_shutdown.get()}
-AutoActivate=0
-DisableTelemetry={self.opt_telemetry.get()}
-DisplayLevel={self.opt_display.get()}
-AutoInstallation=False
-"""
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content)
-            dbg(f"  INI écrit : {fpath}", "OK")
-            dbg("  Contenu INI :")
-            for line in content.strip().splitlines():
-                dbg(f"    {line}")
-            return fpath
+            # Apps exclues
+            excluded_apps = []
+            for name, var in self.apps_vars.items():
+                if not var.get():
+                    excluded_apps.append(APPS_MAP[name])
+            dbg(f"  Apps exclues : {excluded_apps}")
+
+            exclude_lines = ""
+            for app_id in excluded_apps:
+                exclude_lines += f'      <ExcludeApp ID="{app_id}" />\n'
+
+            # Pré-calculer les booléens en strings XML
+            updates_enabled = "TRUE" if self.opt_updates.get() else "FALSE"
+            accept_eula = "TRUE" if self.opt_eula.get() else "FALSE"
+            force_shutdown = "TRUE" if self.opt_shutdown.get() else "FALSE"
+            pin_taskbar = "TRUE" if self.opt_pin_taskbar.get() else "FALSE"
+            display_level = "Full" if self.opt_display.get() else "None"
+
+            xml = (
+                '<Configuration>\n'
+                f'  <Add SourcePath="{src}" OfficeClientEdition="{edition}"'
+                f' Channel="{channel_odt}" Version="{ver}">\n'
+                f'    <Product ID="{suite_id}">\n'
+                f'      <Language ID="{lang}" />\n'
+                f'{exclude_lines}'
+                f'    </Product>\n'
+                f'  </Add>\n'
+                f'  <Updates Enabled="{updates_enabled}"'
+                f' Channel="{channel_odt}" />\n'
+                f'  <Display Level="{display_level}"'
+                f' AcceptEULA="{accept_eula}" />\n'
+                f'  <Property Name="FORCEAPPSHUTDOWN"'
+                f' Value="{force_shutdown}" />\n'
+                f'  <Property Name="PinIconsToTaskbar"'
+                f' Value="{pin_taskbar}" />\n'
+                f'  <Property Name="AUTOACTIVATE" Value="0" />\n'
+                f'</Configuration>'
+            )
+
+            dbg(f"  Suite ID  : {suite_id}")
+            dbg(f"  Canal     : {channel_odt}")
+            dbg(f"  Source    : {src}")
+            dbg(f"  Edition   : {edition}-bit")
+            dbg(f"  Display   : {display_level}")
+
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            now = datetime.datetime.now().strftime('%Y%m%d-%H%M')
+            xml_path = os.path.join(script_dir, f"_install_config_{now}.xml")
+
+            with open(xml_path, "w", encoding="utf-8") as f:
+                f.write(xml)
+            dbg(f"  XML écrit : {xml_path}", "OK")
+            return xml_path
 
         except Exception as e:
-            dbg(f"  Exception génération INI : {e}", "ERR")
+            dbg(f"  Exception génération XML : {e}", "ERR")
             dbg(traceback.format_exc(), "ERR")
             return None
 
